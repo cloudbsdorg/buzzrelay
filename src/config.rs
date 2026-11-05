@@ -10,11 +10,20 @@ pub struct RedisConfig {
 
 #[derive(Clone, Deserialize)]
 pub struct Config {
+    /// Seeds the `streams` table on first start; afterwards the table (and
+    /// the admin API) decide which streams run.
+    #[serde(default)]
     pub streams: Vec<String>,
     pub db: String,
     pub hostname: String,
     pub listen_port: u16,
     pub redis: Option<RedisConfig>,
+    /// Loopback port of the admin API; unset = no admin API.
+    #[serde(default)]
+    pub admin_listen_port: Option<u16>,
+    /// File holding the admin bearer token (mode at most 0640, no symlink).
+    #[serde(default)]
+    pub admin_token_file: Option<String>,
     priv_key_file: String,
     pub_key_file: String,
 }

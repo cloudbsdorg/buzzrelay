@@ -2,7 +2,7 @@
 name = "buzzrelay"
 version = "0.1.0"
 edition = "2021"
-repository = "https://github.com/astro/buzzrelay"
+repository = "https://github.com/cloudbsdorg/buzzrelay"
 homepage = "https://relay.fedi.buzz"
 
 [dependencies]
@@ -23,7 +23,6 @@ chrono = "0.4"
 eventsource-stream = "0.2"
 futures = "0.3"
 tokio-postgres = "0.7"
-systemd = "0.10"
 metrics = "0.24"
 metrics-util = "0.20"
 metrics-exporter-prometheus = "0.18"
@@ -32,6 +31,19 @@ urlencoding = "2"
 httpdate = "1"
 redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
 lru = "0.18"
+sha2 = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# readiness and watchdog notifications; only meaningful under systemd
+systemd = { version = "0.10", optional = true }
+
+[features]
+default = ["systemd"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "time", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [profile.release]
 lto = true

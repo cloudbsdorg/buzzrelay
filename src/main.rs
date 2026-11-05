@@ -27,8 +27,15 @@ mod relay;
 mod activitypub;
 mod actor_cache;
 mod endpoint;
+mod admin_backend;
+mod notify;
+mod policy;
+mod streams;
+mod stats;
+mod admin;
 
 use actor::Actor;
+use activitypub::FollowResponse;
 use state::State;
 
 
@@ -143,21 +150,38 @@ async fn post_language_relay(
     post_relay(state, endpoint, target).await
 }
 
+fn accepted() -> Response {
+    (StatusCode::ACCEPTED,
+     [("content-type", "application/activity+json")],
+     "{}"
+    ).into_response()
+}
+
+/// A sharedInbox receives the actual follow target in the `object` field.
+fn retarget(target: actor::Actor, object: Option<&serde_json::Value>, hostname: &str) -> actor::Actor {
+    match object.and_then(Actor::from_object) {
+        Some(action_target) if action_target.host.as_str() == hostname => action_target,
+        _ => target,
+    }
+}
+
+async fn publish_to_redis(state: &State, payload: &serde_json::Value) {
+    let Some((redis, in_topic)) = &state.redis else { return; };
+    let Ok(data) = serde_json::to_vec(payload) else { return; };
+    if let Err(e) = redis::Cmd::publish(in_topic.as_ref(), data)
+        .query_async::<redis::Value>(&mut redis.clone())
+        .await
+    {
+        tracing::error!("redis publish: {}", e);
+    }
+}
+
 async fn post_relay(
     state: State,
     endpoint: endpoint::Endpoint<'_>,
-    mut target: actor::Actor
+    target: actor::Actor
 ) -> Response {
-    if let Some((redis, in_topic)) = &state.redis {
-        if let Ok(data) = serde_json::to_vec(&endpoint.payload) {
-            if let Err(e) = redis::Cmd::publish(in_topic.as_ref(), data)
-                .query_async::<redis::Value>(&mut redis.clone())
-                .await
-            {
-                tracing::error!("redis publish: {}", e);
-            }
-        }
-    }
+    publish_to_redis(&state, &endpoint.payload).await;
 
     let remote_actor = endpoint.remote_actor(&state.client, &state.actor_cache, target.key_id(), state.priv_key.clone())
         .await
@@ -179,110 +203,85 @@ async fn post_relay(
         }
     };
     let object_type = action.object.as_ref()
-        .and_then(|object| object.get("type").cloned())
-        .and_then(|object_type| object_type.as_str().map(std::string::ToString::to_string));
-
-    if action.action_type == "Follow" {
-        let Ok(remote_actor) = remote_actor else {
-            return (StatusCode::BAD_REQUEST, "Invalid actor").into_response();
-        };
-        if let Some(action_target) = action.object.and_then(|object| Actor::from_object(&object)) {
-            if action_target.host == state.hostname {
-                // A sharedInbox receives the actual follow target in the
-                // `object` field.
-                target = action_target;
-            }
+        .and_then(|object| object.get("type"))
+        .and_then(|object_type| object_type.as_str());
+    let is_follow = action.action_type == "Follow";
+    let is_unfollow = action.action_type == "Undo" && object_type == Some("Follow");
+    if !is_follow && !is_unfollow {
+        track_request("POST", "relay", "unrecognized");
+        return accepted();
+    }
+    let Ok(remote_actor) = remote_actor else {
+        return (StatusCode::BAD_REQUEST, "Invalid actor").into_response();
+    };
+    if is_follow {
+        let target = retarget(target, action.object.as_ref(), &state.hostname);
+        let blocked = state.policy().follower_blocked(&remote_actor.id, &remote_actor.inbox);
+        tokio::spawn(answer_follow(state, target, remote_actor, endpoint.payload, action.id, blocked));
+        return accepted();
+    }
+    let follow = action.object.as_ref().and_then(|object| object.get("object"));
+    let target = retarget(target, follow, &state.hostname);
+    match state.database.del_follow(&remote_actor.id, &target.uri()).await {
+        Ok(()) => {
+            track_request("POST", "relay", "unfollow");
+            accepted()
         }
-        let priv_key = state.priv_key.clone();
-        let client = state.client.clone();
-        tokio::spawn(async move {
-            let accept_id = format!(
-                "https://{}/activity/accept/{}/{}",
-                state.hostname,
-                urlencoding::encode(&target.uri()),
-                urlencoding::encode(&remote_actor.inbox),
-            );
-            let accept = activitypub::Action {
-                jsonld_context: serde_json::Value::String("https://www.w3.org/ns/activitystreams".to_string()),
-                action_type: "Accept".to_string(),
-                actor: target.uri(),
-                to: Some(json!(remote_actor.id.clone())),
-                id: accept_id,
-                object: Some(endpoint.payload),
-            };
-            let result = send::send(
-                client.as_ref(), &remote_actor.inbox,
-                &target.key_id(),
-                &priv_key,
-                &accept,
-            ).await;
-            match result {
+        Err(e) => {
+            tracing::error!("del_follow: {}", e);
+            track_request("POST", "relay", "unfollow_error");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response()
+        }
+    }
+}
+
+/// Sends the Accept (and records the follow) or, for a blocked domain, a
+/// Reject (and records nothing).
+async fn answer_follow(
+    state: State,
+    target: actor::Actor,
+    remote_actor: std::sync::Arc<activitypub::Actor>,
+    follow: serde_json::Value,
+    follow_id: String,
+    blocked: bool,
+) {
+    let kind = if blocked { FollowResponse::Reject } else { FollowResponse::Accept };
+    let response = activitypub::follow_response(
+        kind, &state.hostname, &target.uri(), &remote_actor.id, &remote_actor.inbox, follow,
+    );
+    let result = send::send(
+        state.client.as_ref(), &remote_actor.inbox,
+        &target.key_id(),
+        &state.priv_key,
+        &response,
+    ).await;
+    match (result, blocked) {
+        (Err(e), _) => {
+            tracing::error!("post {kind:?}: {e}");
+            track_request("POST", "relay", if blocked { "follow_reject_error" } else { "follow_accept_error" });
+        }
+        (Ok(()), true) => {
+            tracing::info!("rejected follow of {} by {}: blocked domain", target.uri(), remote_actor.id);
+            track_request("POST", "relay", "follow_rejected");
+            stats::bump(&state.stats.counters.follows_rejected);
+        }
+        (Ok(()), false) => {
+            match state.database.add_follow(
+                &remote_actor.id,
+                &remote_actor.inbox,
+                &target.uri(),
+                Some(&follow_id),
+            ).await {
                 Ok(()) => {
-                    match state.database.add_follow(
-                        &remote_actor.id,
-                        &remote_actor.inbox,
-                        &target.uri(),
-                    ).await {
-                        Ok(()) => {
-                            track_request("POST", "relay", "follow");
-                        }
-                        Err(e) => {
-                            // duplicate key constraint
-                            tracing::error!("add_follow: {}", e);
-                            track_request("POST", "relay", "follow_error");
-                        }
-                    }
+                    track_request("POST", "relay", "follow");
+                    stats::bump(&state.stats.counters.follows_accepted);
                 }
                 Err(e) => {
-                    tracing::error!("post accept: {}", e);
-                    track_request("POST", "relay", "follow_accept_error");
+                    tracing::error!("add_follow: {}", e);
+                    track_request("POST", "relay", "follow_error");
                 }
             }
-        });
-
-        (StatusCode::ACCEPTED,
-         [("content-type", "application/activity+json")],
-         "{}"
-        ).into_response()
-    } else if action.action_type == "Undo" && object_type == Some("Follow".to_string()) {
-        let Ok(remote_actor) = remote_actor else {
-            return (StatusCode::BAD_REQUEST, "Invalid actor").into_response();
-        };
-        if let Some(action_target) = action.object
-            .and_then(|object| object.get("object")
-                      .and_then(Actor::from_object))
-        {
-            if action_target.host == state.hostname {
-                // A sharedInbox receives the actual follow target in the
-                // `object` field.
-                target = action_target;
-            }
         }
-        match state.database.del_follow(
-            &remote_actor.id,
-            &target.uri(),
-        ).await {
-            Ok(()) => {
-                track_request("POST", "relay", "unfollow");
-                (StatusCode::ACCEPTED,
-                 [("content-type", "application/activity+json")],
-                 "{}"
-                ).into_response()
-            }
-            Err(e) => {
-                tracing::error!("del_follow: {}", e);
-                track_request("POST", "relay", "unfollow_error");
-                (StatusCode::INTERNAL_SERVER_ERROR,
-                 format!("{e}")
-                 ).into_response()
-            }
-        }
-    } else {
-        track_request("POST", "relay", "unrecognized");
-        (StatusCode::ACCEPTED,
-         [("content-type", "application/activity+json")],
-         "{}"
-        ).into_response()
     }
 }
 
@@ -378,7 +377,7 @@ async fn main() {
         &std::env::args().nth(1)
             .expect("Call with config.yaml")
     );
-    let database = db::Database::connect(&config.db).await;
+    let database = db::Database::connect(&config.db, &config.streams).await;
     let mut redis = None;
     if let Some(redis_config) = config.redis.clone() {
         let mut redis_url = Url::parse(&redis_config.connection)
@@ -407,8 +406,13 @@ async fn main() {
         .unwrap();
     let state = State::new(config.clone(), database, redis, client);
 
-    let stream_rx = stream::spawn(config.streams.clone().into_iter());
+    state.reload_policy().await
+        .expect("load policy");
+    let (spawner, stream_rx) = stream::channel_and_spawner();
+    let supervisor = streams::Supervisor::new(spawner);
+    spawn_supervisor(state.clone(), supervisor.clone());
     relay::spawn(state.clone(), stream_rx);
+    spawn_admin(&config, state.clone(), supervisor, recorder).await;
 
     let app = Router::new()
         .route("/tag/{tag}", get(get_tag_actor).post(post_tag_relay))
@@ -420,9 +424,6 @@ async fn main() {
         .route("/.well-known/webfinger", get(webfinger))
         .route("/.well-known/nodeinfo", get(nodeinfo))
         .route("/api/v1/instance", get(instanceinfo))
-        .route("/metrics", get(|| async move {
-            recorder.render().into_response()
-        }))
         .with_state(state)
         .fallback_service(ServeDir::new("static"));
 
@@ -431,10 +432,64 @@ async fn main() {
     let server = axum::serve(listener, app.into_make_service());
 
     tracing::info!("serving on {}", addr);
-    systemd::daemon::notify(false, [(systemd::daemon::STATE_READY, "1")].iter())
-        .unwrap();
+    notify::ready();
     server.await
         .unwrap();
+}
+
+/// Keeps the running streams equal to the enabled rows of `streams`, and
+/// the policy snapshot fresh, every period and on admin request.
+fn spawn_supervisor(state: State, supervisor: std::sync::Arc<streams::Supervisor>) {
+    tokio::spawn(async move {
+        loop {
+            match state.database.enabled_streams().await {
+                Ok(urls) => {
+                    let (started, stopped) = supervisor.reconcile(&urls);
+                    for url in started {
+                        tracing::info!("stream {} started", streams::stream_id(&url));
+                    }
+                    for url in stopped {
+                        tracing::info!("stream {} stopped", streams::stream_id(&url));
+                    }
+                }
+                Err(e) => tracing::error!("streams: {e}"),
+            }
+            if let Err(e) = state.reload_policy().await {
+                tracing::error!("policy: {e}");
+            }
+            supervisor.wait().await;
+        }
+    });
+}
+
+/// The admin API on its own loopback listener. Without `admin_listen_port`
+/// there is none (and no /metrics); with it, a usable token is required.
+async fn spawn_admin(
+    config: &config::Config,
+    state: State,
+    supervisor: std::sync::Arc<streams::Supervisor>,
+    metrics: metrics_exporter_prometheus::PrometheusHandle,
+) {
+    let Some(port) = config.admin_listen_port else {
+        tracing::warn!("admin_listen_port unset: admin API and /metrics disabled");
+        return;
+    };
+    let token_file = config.admin_token_file.as_deref()
+        .expect("admin_listen_port needs admin_token_file");
+    let token = match admin::AdminToken::from_file(std::path::Path::new(token_file)) {
+        Ok(token) => std::sync::Arc::new(token),
+        Err(e) => panic!("{token_file}: {e}"),
+    };
+    let backend = admin_backend::RelayAdmin { state, supervisor, metrics };
+    let app = admin::router(backend, token);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = tokio::net::TcpListener::bind(addr).await
+        .expect("bind admin_listen_port");
+    tracing::info!("admin API on {}", addr);
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service()).await
+            .expect("admin server");
+    });
 }
 
 fn exit_on_panic() {

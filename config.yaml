@@ -8,7 +8,7 @@ streams:
   # an access_token that must be obtained from
   # https://example.com/settings/applications/new
   # with permission `read:statuses`
-  - "https://example.com/api/v1/streaming/public?access_token=EfDOWQkbWFfWsZB-4Xv0axfraMTRzSV0GhB1FVAleBs"
+  - "https://example.com/api/v1/streaming/public?access_token=YOUR_ACCESS_TOKEN"
 # external https hostname
 hostname: relay.fedi.buzz
 # where your reverse proxy will connect to
@@ -23,3 +23,6 @@ redis:
   connection: "redis://127.0.0.1:6378/"
   password_file: "redis_password.txt"
   in_topic: "relay-in"
+# Optional admin API, loopback only (see README)
+#admin_listen_port: 3001
+#admin_token_file: "admin.token"
