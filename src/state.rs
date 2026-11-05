@@ -2,8 +2,8 @@ use axum::{
     extract::FromRef,
 };
 use sigh::{PrivateKey, PublicKey};
-use std::sync::Arc;
-use crate::{config::Config, db::Database, actor_cache::ActorCache};
+use std::sync::{Arc, RwLock};
+use crate::{config::Config, db::Database, actor_cache::ActorCache, policy::Policy, stats::RelayStats};
 
 #[derive(Clone)]
 pub struct State {
@@ -14,6 +14,10 @@ pub struct State {
     pub hostname: Arc<String>,
     pub priv_key: Arc<PrivateKey>,
     pub pub_key: Arc<PublicKey>,
+    /// Snapshot of the policy tables; replaced on every admin change and
+    /// every reconcile period.
+    policy: Arc<RwLock<Arc<Policy>>>,
+    pub stats: Arc<RelayStats>,
 }
 
 
@@ -35,6 +39,18 @@ impl State {
             hostname: Arc::new(config.hostname),
             priv_key,
             pub_key,
+            policy: Arc::default(),
+            stats: Arc::default(),
         }
+    }
+
+    pub fn policy(&self) -> Arc<Policy> {
+        self.policy.read().unwrap().clone()
+    }
+
+    pub async fn reload_policy(&self) -> Result<(), tokio_postgres::Error> {
+        let policy = Arc::new(self.database.load_policy().await?);
+        *self.policy.write().unwrap() = policy;
+        Ok(())
     }
 }

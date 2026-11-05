@@ -1,11 +1,11 @@
-use std::{sync::Arc, collections::{HashSet, HashMap}, time::{Duration, Instant}};
+use std::{sync::{Arc, atomic::Ordering}, collections::{HashSet, HashMap}, time::Instant};
 use futures::{channel::mpsc::{channel, Sender}, StreamExt};
 use metrics::{counter, histogram};
 use serde::Deserialize;
 use serde_json::json;
 use sigh::PrivateKey;
 use tokio::sync::mpsc::Receiver;
-use crate::{send, actor, state::State};
+use crate::{send, actor, state::State, policy::{self, Policy}, stats::{bump, HostState, RelayStats}};
 
 #[derive(Deserialize)]
 struct Post<'a> {
@@ -13,6 +13,7 @@ struct Post<'a> {
     pub uri: &'a str,
     pub tags: Option<Vec<Tag<'a>>>,
     pub language: Option<&'a str>,
+    pub account: Option<Account>,
 }
 
 impl Post<'_> {
@@ -42,37 +43,7 @@ impl Post<'_> {
             .chain(
                 self.tags()
                     .into_iter()
-                    .flat_map(|ref s| {
-                        // Don't handle the empty hashtag `#`
-                        if s.is_empty() {
-                            return vec![];
-                        }
-
-                        let actor1 = actor::ActorKind::from_tag(s);
-
-                        // Distribute hashtags that end in a date to
-                        // followers of the hashtag with the date
-                        // stripped. Example: #dd1302 -> #dd
-                        let mut first_trailing_digit = 0;
-                        let mut scanning_digits = false;
-                        for (pos, c) in s.char_indices() {
-                            if char::is_digit(c, 10) {
-                                if ! scanning_digits {
-                                    first_trailing_digit = pos;
-                                    scanning_digits = true;
-                                }
-                            } else {
-                                scanning_digits = false;
-                            }
-                        }
-                        if scanning_digits && first_trailing_digit > 0 {
-                            let tag = &s[..first_trailing_digit];
-                            let actor2 = actor::ActorKind::from_tag(tag);
-                            vec![actor1, actor2]
-                        } else {
-                            vec![actor1]
-                        }
-                    })
+                    .flat_map(|ref s| tag_kinds(s))
             )
             .chain(
                 self.language
@@ -86,6 +57,74 @@ impl Post<'_> {
                 host: hostname.clone(),
                 kind,
             })
+    }
+}
+
+/// Whether a post from the firehose is relayed at all.
+#[derive(Debug, PartialEq, Eq)]
+enum PostVerdict {
+    Relay,
+    Paused,
+    SourceBlocked,
+}
+
+fn post_verdict(policy: &Policy, post: &Post) -> PostVerdict {
+    if policy.paused {
+        return PostVerdict::Paused;
+    }
+    let host = post.host();
+    let acct = post.account.as_ref()
+        .and_then(|account| policy::full_acct(&account.acct, host.as_deref()));
+    // url and uri are both the sender's to choose: either naming a blocked host drops the post
+    let uri_host = policy::host_of(post.uri);
+    if policy.source_blocked(host.as_deref(), acct.as_deref())
+        || uri_host.is_some_and(|h| policy.source_blocked(Some(&h), None))
+    {
+        PostVerdict::SourceBlocked
+    } else {
+        PostVerdict::Relay
+    }
+}
+
+/// Whether one subscriber inbox gets a post.
+#[derive(Debug, PartialEq, Eq)]
+enum InboxVerdict {
+    Deliver,
+    /// back to the instance the post came from
+    Origin,
+    DomainBlocked,
+}
+
+fn inbox_verdict(policy: &Policy, inbox_host: Option<&str>, post_host: Option<&str>) -> InboxVerdict {
+    match inbox_host {
+        Some(inbox_host) if Some(inbox_host) == post_host => InboxVerdict::Origin,
+        Some(inbox_host) if policy.domain_blocked(inbox_host) => InboxVerdict::DomainBlocked,
+        _ => InboxVerdict::Deliver,
+    }
+}
+
+#[derive(Deserialize)]
+struct Account {
+    /// absent: no account filter applies, the post still relays
+    #[serde(default)]
+    acct: String,
+}
+
+/// The relay actors a hashtag is delivered to. Hashtags that end in a
+/// date also go to followers of the hashtag with the date stripped.
+/// Example: #dd1302 -> #dd
+fn tag_kinds(s: &str) -> Vec<actor::ActorKind> {
+    // Don't handle the empty hashtag `#`
+    if s.is_empty() {
+        return vec![];
+    }
+    let actor1 = actor::ActorKind::from_tag(s);
+    let digits = s.bytes().rev().take_while(u8::is_ascii_digit).count();
+    let first_trailing_digit = s.len() - digits;
+    if digits > 0 && first_trailing_digit > 0 {
+        vec![actor1, actor::ActorKind::from_tag(&s[..first_trailing_digit])]
+    } else {
+        vec![actor1]
     }
 }
 
@@ -103,39 +142,33 @@ struct Job {
     inbox_url: reqwest::Url,
 }
 
-fn spawn_worker(client: Arc<reqwest::Client>) -> Sender<Job> {
+fn spawn_worker(client: Arc<reqwest::Client>, host: Arc<HostState>, stats: Arc<RelayStats>) -> Sender<Job> {
     let (tx, mut rx) = channel(512);
 
     tokio::spawn(async move {
-        let mut errors = 0u32;
-        let mut last_request = None;
-
         while let Some(Job { post_url, actor_id, key_id, private_key, body, inbox_url }) = rx.next().await {
-            if errors > 0 && last_request.is_some_and(|last_request: Instant|
-                last_request.elapsed() < Duration::from_secs(10) * errors
-            ) {
+            host.queued.fetch_sub(1, Ordering::Relaxed);
+            if host.backoff().is_some() {
                 // there have been errors, skip for time proportional
                 // to the number of subsequent errors
                 tracing::trace!("skip {} from {} to {}", post_url, actor_id, inbox_url);
+                bump(&stats.counters.deliveries_skipped_backoff);
                 continue;
             }
 
             tracing::debug!("relay {} from {} to {}", post_url, actor_id, inbox_url);
-            last_request = Some(Instant::now());
+            *host.last_request.lock().unwrap() = Some(tokio::time::Instant::now());
             if let Err(e) = send::send_raw(
                 &client, inbox_url.as_str(),
                 &key_id, &private_key, body
             ).await {
                 tracing::error!("relay::send {:?}", e);
-                errors = errors.saturating_add(1);
+                bump(&stats.counters.deliveries_failed);
+                let _ = host.consecutive_errors.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |e| Some(e.saturating_add(1)));
             } else {
-                // success
-                errors = 0;
-                systemd::daemon::notify(
-                    false, [
-                        (systemd::daemon::STATE_WATCHDOG, "1")
-                    ].iter()
-                ).unwrap();
+                bump(&stats.counters.deliveries_ok);
+                host.consecutive_errors.store(0, Ordering::Relaxed);
+                crate::notify::watchdog();
             }
         }
 
@@ -143,6 +176,142 @@ fn spawn_worker(client: Arc<reqwest::Client>) -> Sender<Job> {
     });
 
     tx
+}
+
+/// Hands one Announce to the worker queue of the inbox's host.
+fn enqueue(state: &State, workers: &mut HashMap<String, Sender<Job>>, job: Job) {
+    let host_name = job.inbox_url.host_str().unwrap_or("").to_string();
+    let host = state.stats.host(&host_name);
+    let tx = workers.entry(host_name)
+        .or_insert_with(|| spawn_worker(state.client.clone(), host.clone(), state.stats.clone()));
+    host.queued.fetch_add(1, Ordering::Relaxed);
+    if tx.try_send(job).is_ok() {
+        bump(&state.stats.counters.deliveries_enqueued);
+    } else {
+        host.queued.fetch_sub(1, Ordering::Relaxed);
+        bump(&state.stats.counters.deliveries_dropped_queue_full);
+    }
+}
+
+fn announce(state: &State, actor_id: &str, published: &str, post: &Post, post_url: &str) -> Arc<Vec<u8>> {
+    let announce_id = format!("https://{}/announce/{}", state.hostname, urlencoding::encode(post_url));
+    let body = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "type": "Announce",
+        "actor": actor_id,
+        "published": published,
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "object": &post.uri,
+        "id": announce_id,
+    });
+    Arc::new(serde_json::to_vec(&body).unwrap())
+}
+
+struct Delivery<'a> {
+    post_url: &'a Arc<String>,
+    post_host: Option<&'a str>,
+    body: Arc<Vec<u8>>,
+    policy: &'a Policy,
+}
+
+/// Queues the Announce from one relay actor to each of its followers'
+/// inboxes not yet served for this post.
+async fn deliver(
+    state: &State,
+    workers: &mut HashMap<String, Sender<Job>>,
+    actor: &actor::Actor,
+    delivery: &Delivery<'_>,
+    seen_inboxes: &mut HashSet<String>,
+) -> usize {
+    let mut queued = 0;
+    let actor_id = Arc::new(actor.uri());
+    let inboxes = match state.database.get_following_inboxes(&actor_id).await {
+        Ok(inboxes) => inboxes,
+        Err(e) => {
+            tracing::error!("get_following_inboxes: {e}");
+            return 0;
+        }
+    };
+    for inbox in inboxes {
+        let Ok(inbox_url) = reqwest::Url::parse(&inbox) else { continue; };
+        // Avoid duplicate processing.
+        if !seen_inboxes.insert(inbox) {
+            continue;
+        }
+        match inbox_verdict(delivery.policy, inbox_url.host_str(), delivery.post_host) {
+            InboxVerdict::Deliver => {}
+            // Prevent relaying back to the originating instance.
+            InboxVerdict::Origin => continue,
+            InboxVerdict::DomainBlocked => {
+                bump(&state.stats.counters.deliveries_skipped_domain_blocked);
+                continue;
+            }
+        }
+        enqueue(state, workers, Job {
+            post_url: delivery.post_url.clone(),
+            actor_id: actor_id.clone(),
+            body: delivery.body.clone(),
+            key_id: actor.key_id(),
+            private_key: state.priv_key.clone(),
+            inbox_url,
+        });
+        queued += 1;
+    }
+    queued
+}
+
+/// Relays one firehose post to every subscribed inbox the policy allows.
+async fn relay_post(state: &State, workers: &mut HashMap<String, Sender<Job>>, data: &str) {
+    let post: Post = match serde_json::from_str(data) {
+        Ok(post) => post,
+        Err(e) => {
+            tracing::error!("parse error: {}", e);
+            tracing::trace!("data: {}", data);
+            return;
+        }
+    };
+    let Some(url) = post.url else {
+        // skip reposts
+        counter!("relay_posts_total", "action" => "skip").increment(1);
+        bump(&state.stats.counters.posts_skipped_repost);
+        return;
+    };
+    let post_url = Arc::new(url.to_string());
+    let policy = state.policy();
+    match post_verdict(&policy, &post) {
+        PostVerdict::Relay => {}
+        PostVerdict::Paused => {
+            counter!("relay_posts_total", "action" => "paused").increment(1);
+            bump(&state.stats.counters.posts_skipped_paused);
+            return;
+        }
+        PostVerdict::SourceBlocked => {
+            counter!("relay_posts_total", "action" => "source_blocked").increment(1);
+            bump(&state.stats.counters.posts_skipped_source_blocked);
+            return;
+        }
+    }
+    let Ok(post_url_url) = reqwest::Url::parse(&post_url) else { return; };
+    let mut seen_actors = HashSet::new();
+    let mut seen_inboxes = HashSet::new();
+    let mut queued = 0;
+    let published = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    for actor in post.relay_targets(state.hostname.clone()) {
+        if !seen_actors.insert(actor.clone()) {
+            continue;
+        }
+        let body = announce(state, &actor.uri(), &published, &post, &post_url);
+        let delivery = Delivery { post_url: &post_url, post_host: post_url_url.host_str(), body, policy: &policy };
+        queued += deliver(state, workers, &actor, &delivery, &mut seen_inboxes).await;
+    }
+    // relayed = handed to at least one inbox queue, not merely matched
+    if queued == 0 {
+        counter!("relay_posts_total", "action" => "no_relay").increment(1);
+        bump(&state.stats.counters.posts_without_followers);
+    } else {
+        counter!("relay_posts_total", "action" => "relay").increment(1);
+        bump(&state.stats.counters.posts_relayed);
+    }
 }
 
 pub fn spawn(
@@ -154,85 +323,7 @@ pub fn spawn(
 
         while let Some(data) = stream_rx.recv().await {
             let t1 = Instant::now();
-            let post: Post = match serde_json::from_str(&data) {
-                Ok(post) => post,
-                Err(e) => {
-                    tracing::error!("parse error: {}", e);
-                    tracing::trace!("data: {}", data);
-                    continue;
-                }
-            };
-            let post_url = if let Some(url) = post.url {
-                Arc::new(url.to_string())
-            } else {
-                // skip reposts
-                counter!("relay_posts_total", "action" => "skip")
-                    .increment(1);
-                continue;
-            };
-            let mut seen_actors = HashSet::new();
-            let mut seen_inboxes = HashSet::new();
-            let published = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            for actor in post.relay_targets(state.hostname.clone()) {
-                if seen_actors.contains(&actor) {
-                    continue;
-                }
-
-                let actor_id = Arc::new(actor.uri());
-                let announce_id = format!("https://{}/announce/{}", state.hostname, urlencoding::encode(&post_url));
-                let body = json!({
-                    "@context": "https://www.w3.org/ns/activitystreams",
-                    "type": "Announce",
-                    "actor": *actor_id,
-                    "published": &published,
-                    "to": ["https://www.w3.org/ns/activitystreams#Public"],
-                    "object": &post.uri,
-                    "id": announce_id,
-                });
-                let Ok(post_url_url) = reqwest::Url::parse(&post_url) else { continue; };
-                let body = Arc::new(
-                    serde_json::to_vec(&body)
-                        .unwrap()
-                );
-                for inbox in state.database.get_following_inboxes(&actor_id).await.unwrap() {
-                    let Ok(inbox_url) = reqwest::Url::parse(&inbox) else { continue; };
-
-                    // Avoid duplicate processing.
-                    if seen_inboxes.contains(&inbox) {
-                        continue;
-                    }
-                    seen_inboxes.insert(inbox);
-
-                    // Prevent relaying back to the originating instance.
-                    if inbox_url.host_str() == post_url_url.host_str() {
-                        continue;
-                    }
-
-                    // Lookup/create worker queue per inbox.
-                    let tx = workers.entry(inbox_url.host_str().unwrap_or("").to_string())
-                        .or_insert_with(|| spawn_worker(state.client.clone()));
-                    // Create queue item.
-                    let job = Job {
-                        post_url: post_url.clone(),
-                        actor_id: actor_id.clone(),
-                        body: body.clone(),
-                        key_id: actor.key_id(),
-                        private_key: state.priv_key.clone(),
-                        inbox_url,
-                    };
-                    // Enqueue job for worker.
-                    let _ = tx.try_send(job);
-                }
-
-                seen_actors.insert(actor);
-            }
-            if seen_inboxes.is_empty() {
-                counter!("relay_posts_total", "action" => "no_relay")
-                    .increment(1);
-            } else {
-                counter!("relay_posts_total", "action" => "relay")
-                    .increment(1);
-            }
+            relay_post(&state, &mut workers, &data).await;
             let t2 = Instant::now();
             histogram!("relay_post_duration").record(t2 - t1);
         }
@@ -253,6 +344,7 @@ mod test {
                 name: "foo",
             }]),
             language: Some("en"),
+            account: None,
         };
         let mut kinds = post.relay_target_kinds();
         assert_eq!(kinds.next(), Some(ActorKind::InstanceRelay("example.com".to_string())));
@@ -270,6 +362,7 @@ mod test {
                 name: "",
             }]),
             language: None,
+            account: None,
         };
         let mut kinds = post.relay_target_kinds();
         assert_eq!(kinds.next(), Some(ActorKind::InstanceRelay("example.com".to_string())));
@@ -285,6 +378,7 @@ mod test {
                 name: "23",
             }]),
             language: None,
+            account: None,
         };
         let mut kinds = post.relay_target_kinds();
         assert_eq!(kinds.next(), Some(ActorKind::InstanceRelay("example.com".to_string())));
@@ -301,6 +395,7 @@ mod test {
                 name: "dd1302",
             }]),
             language: None,
+            account: None,
         };
         let mut kinds = post.relay_target_kinds();
         assert_eq!(kinds.next(), Some(ActorKind::InstanceRelay("example.com".to_string())));
@@ -318,6 +413,7 @@ mod test {
                 name: "スコティッシュ・フォールド・ロングヘアー",
             }]),
             language: Some("ja"),
+            account: None,
         };
         let mut kinds = post.relay_target_kinds();
         assert_eq!(kinds.next(), Some(ActorKind::InstanceRelay("example.com".to_string())));
@@ -333,6 +429,7 @@ mod test {
             uri: "http://example.com/post/1",
             tags: None,
             language: Some("de_CH"),
+            account: None,
         };
         let mut kinds = post.relay_target_kinds();
         assert_eq!(kinds.next(), Some(ActorKind::InstanceRelay("example.com".to_string())));
@@ -347,9 +444,59 @@ mod test {
             uri: "http://example.com/post/1",
             tags: None,
             language: Some("23q"),
+            account: None,
         };
         let mut kinds = post.relay_target_kinds();
         assert_eq!(kinds.next(), Some(ActorKind::InstanceRelay("example.com".to_string())));
         assert_eq!(kinds.next(), None);
+    }
+
+    fn post<'a>(url: &'a str, acct: Option<&str>) -> Post<'a> {
+        Post {
+            url: Some(url),
+            uri: url,
+            tags: None,
+            language: None,
+            account: acct.map(|acct| Account { acct: acct.to_string() }),
+        }
+    }
+
+    #[test]
+    fn posts_relay_unless_paused_or_source_blocked() {
+        let open = Policy::default();
+        assert_eq!(post_verdict(&open, &post("https://a.example/@alice/1", Some("alice"))), PostVerdict::Relay);
+        let paused = Policy::new([], [], true);
+        assert_eq!(post_verdict(&paused, &post("https://a.example/@alice/1", Some("alice"))), PostVerdict::Paused);
+        let blocked = Policy::new([], [
+            policy::SourcePattern::parse("spam.example").unwrap(),
+            policy::SourcePattern::parse("bot@a.example").unwrap(),
+        ], false);
+        assert_eq!(post_verdict(&blocked, &post("https://spam.example/@x/1", None)), PostVerdict::SourceBlocked);
+        // a local author's bare acct is completed with the post's host
+        assert_eq!(post_verdict(&blocked, &post("https://a.example/@bot/1", Some("bot"))), PostVerdict::SourceBlocked);
+        assert_eq!(post_verdict(&blocked, &post("https://b.example/@bot/1", Some("bot@a.example"))), PostVerdict::SourceBlocked);
+        assert_eq!(post_verdict(&blocked, &post("https://a.example/@alice/1", Some("alice"))), PostVerdict::Relay);
+        // a post whose uri names a blocked host is dropped even if its url does not
+        let mut p = post("https://ok.example/@x/1", None);
+        p.uri = "https://spam.example/users/x/statuses/1";
+        assert_eq!(post_verdict(&blocked, &p), PostVerdict::SourceBlocked);
+    }
+
+    #[test]
+    fn inboxes_on_blocked_domains_or_the_origin_are_skipped() {
+        let policy = Policy::new(["spam.example".to_string()], [], false);
+        assert_eq!(inbox_verdict(&policy, Some("ok.example"), Some("a.example")), InboxVerdict::Deliver);
+        assert_eq!(inbox_verdict(&policy, Some("a.example"), Some("a.example")), InboxVerdict::Origin);
+        assert_eq!(inbox_verdict(&policy, Some("m.spam.example"), Some("a.example")), InboxVerdict::DomainBlocked);
+        assert_eq!(inbox_verdict(&policy, None, Some("a.example")), InboxVerdict::Deliver);
+    }
+
+    #[test]
+    fn posts_parse_the_author_acct() {
+        let data = r#"{"url":"https://a.example/@alice/1","uri":"https://a.example/users/alice/statuses/1","account":{"acct":"alice","id":"1"}}"#;
+        let post: Post = serde_json::from_str(data).unwrap();
+        assert_eq!(post.account.unwrap().acct, "alice");
+        let odd = r#"{"url":"https://a.example/@alice/1","uri":"https://a.example/1","account":{"id":"1"}}"#;
+        assert!(serde_json::from_str::<Post>(odd).is_ok(), "an account without acct must not drop the post");
     }
 }
