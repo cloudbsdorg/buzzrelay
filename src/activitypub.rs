@@ -73,10 +73,13 @@ pub fn follow_response(
     follow: serde_json::Value,
 ) -> Action<serde_json::Value> {
     let id = match kind {
+        // the follower's actor id is part of it: two followers share one
+        // sharedInbox, and one id for both would be deduplicated away
         FollowResponse::Accept => format!(
-            "https://{hostname}/activity/accept/{}/{}",
+            "https://{hostname}/activity/accept/{}/{}/{}",
             urlencoding::encode(target),
             urlencoding::encode(follower_inbox),
+            urlencoding::encode(follower),
         ),
         FollowResponse::Reject => {
             let nonce = std::time::SystemTime::now()
@@ -139,8 +142,18 @@ mod test {
         assert_eq!(accept.action_type, "Accept");
         assert_eq!(accept.actor, "https://relay.test/tag/bsd");
         assert_eq!(accept.to, Some(serde_json::json!("https://a.example/users/alice")));
-        assert_eq!(accept.id, "https://relay.test/activity/accept/https%3A%2F%2Frelay.test%2Ftag%2Fbsd/https%3A%2F%2Fa.example%2Finbox");
+        assert_eq!(accept.id, "https://relay.test/activity/accept/https%3A%2F%2Frelay.test%2Ftag%2Fbsd/https%3A%2F%2Fa.example%2Finbox/https%3A%2F%2Fa.example%2Fusers%2Falice");
         assert_eq!(accept.object, Some(follow));
+    }
+
+    #[test]
+    fn two_followers_on_one_inbox_get_distinct_accept_ids() {
+        let accept = |follower: &str| follow_response(FollowResponse::Accept, "relay.test", "https://relay.test/tag/bsd",
+            follower, "https://a.example/inbox", serde_json::json!({"type": "Follow"}));
+        let alice = accept("https://a.example/users/alice");
+        let bob = accept("https://a.example/users/bob");
+        assert_ne!(alice.id, bob.id, "two followers sharing an inbox must not share an Accept id");
+        assert_eq!(alice.id, accept("https://a.example/users/alice").id, "the id is stable for one follower");
     }
 
     #[test]

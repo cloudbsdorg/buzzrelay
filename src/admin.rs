@@ -35,6 +35,29 @@ impl std::fmt::Debug for AdminToken {
 
 const MIN_TOKEN_LEN: usize = 32;
 
+// The effective uid of this process.
+//
+// std has no `getuid()` and the crate does not depend on libc, so the one
+// call it needs is declared here: std links the C library on every unix
+// target this program runs on.
+extern "C" {
+    fn geteuid() -> u32;
+}
+
+/// The effective uid of this process: 0 for root.
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid() takes no arguments, cannot fail and has no
+    // preconditions.
+    unsafe { geteuid() }
+}
+
+/// May this uid own the token file? Root may, and so may the process
+/// itself. A file owned by anybody else is refused: its owner could
+/// rewrite it and become the holder of the token.
+fn owner_allowed(owner: u32, process: u32) -> bool {
+    owner == 0 || owner == process
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum TokenError {
     Unreadable(String),
@@ -44,6 +67,8 @@ pub enum TokenError {
     TooOpen(u32),
     TooShort,
     Whitespace,
+    /// owned by a user that is neither root nor this process
+    ForeignOwner(u32),
 }
 
 impl std::fmt::Display for TokenError {
@@ -55,14 +80,16 @@ impl std::fmt::Display for TokenError {
             TokenError::TooOpen(mode) => write!(f, "admin_token_file mode {mode:04o} is too open: use 0600 or 0640"),
             TokenError::TooShort => write!(f, "admin_token_file holds fewer than {MIN_TOKEN_LEN} characters"),
             TokenError::Whitespace => write!(f, "admin_token_file must hold one token, no spaces"),
+            TokenError::ForeignOwner(uid) => write!(f, "admin_token_file is owned by uid {uid}: only root or the service user may own it"),
         }
     }
 }
 
 impl AdminToken {
     /// Reads the token file. Refuses a symlink, anything but a regular file,
-    /// and any mode beyond 0640: the deployment owns it root:buzzrelay 0640
-    /// so the service can read but not rewrite it.
+    /// any mode beyond 0640, and any owner but root or this process: the
+    /// deployment owns it root:buzzrelay 0640 so the service can read but
+    /// not rewrite it.
     pub fn from_file(path: &Path) -> Result<Self, TokenError> {
         use std::io::Read;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -88,6 +115,11 @@ impl AdminToken {
         let mode = meta.permissions().mode() & 0o7777;
         if mode & 0o7137 != 0 {
             return Err(TokenError::TooOpen(mode));
+        }
+        // the owner may rewrite the token: only root or the process itself
+        let uid = meta.uid();
+        if !owner_allowed(uid, effective_uid()) {
+            return Err(TokenError::ForeignOwner(uid));
         }
         let mut text = String::new();
         file.read_to_string(&mut text).map_err(unreadable)?;
@@ -412,9 +444,13 @@ fn stream_infos(rows: Vec<StreamRow>, statuses: &[(String, StreamStatus)]) -> Ve
 async fn health<B: AdminBackend>(State(b): State<B>) -> Response {
     let database = b.database_ok().await;
     let statuses = b.stream_statuses();
-    let enabled = b.streams().await.map_or(0, |rows| rows.iter().filter(|s| s.enabled).count());
+    let streams = b.streams().await;
+    // a stream list that cannot be read is not an empty stream list
+    let streams_ok = streams.is_ok();
+    let enabled = streams.map(|rows| rows.iter().filter(|s| s.enabled).count()).unwrap_or(0);
+    let ok = database && streams_ok;
     let body = Health {
-        status: if database { "ok" } else { "degraded" }.into(),
+        status: if ok { "ok" } else { "degraded" }.into(),
         version: env!("CARGO_PKG_VERSION").into(),
         paused: b.policy().paused,
         database,
@@ -422,7 +458,7 @@ async fn health<B: AdminBackend>(State(b): State<B>) -> Response {
         streams_running: statuses.len(),
         streams_connected: statuses.iter().filter(|(_, s)| s.state == StreamState::Connected).count(),
     };
-    let code = if database { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let code = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (code, Json(body)).into_response()
 }
 
@@ -469,7 +505,7 @@ async fn subscribers<B: AdminBackend>(State(b): State<B>, Query(filter): Query<S
     let actor = filter.actor.filter(|a| !a.is_empty());
     let rows = b.follows(actor).await?;
     Ok(Json(rows.into_iter()
-        .filter(|f| only.as_ref().is_none_or(|p| p.follower_blocked(&f.id, &f.inbox)))
+        .filter(|f| only.as_ref().is_none_or(|p| p.follower_matches(&f.id, &f.inbox)))
         .map(|f| Subscriber { domain: domain_of(&f.id), id: f.id, inbox: f.inbox, actor: f.actor })
         .collect()))
 }

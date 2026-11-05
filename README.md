@@ -71,11 +71,19 @@ What changed:
   inbox.
 - **Versioned migrations** (`schema_migrations`). They run on start, inside
   one transaction under an advisory lock, and are idempotent.
-- **Blocked domains.** A Follow from a blocked domain (actor or inbox host,
-  subdomains included) is answered with a signed `Reject`; blocking a domain
-  deletes its follows; deliveries to it are skipped.
+- **Blocked domains.** A Follow from a blocked domain is answered with a
+  signed `Reject`; deliveries to it are skipped. A new Follow is checked on
+  the URL the relay fetched the actor document from (the actor's own id is
+  self-declared), the actor id's host and the inbox host, subdomains
+  included, and fails closed: a fetched URL or an inbox that cannot be read
+  counts as blocked. Blocking a domain also deletes the stored follows whose
+  actor id or inbox is on it. A stored follow does not record the URL its
+  actor was fetched from, so one accepted before the block with a forged id
+  and an inbox elsewhere is not found that way: remove it by its id.
 - **Blocked sources.** Firehose posts are dropped by host (`example.com`,
-  subdomains included) or by account (`user@example.com`).
+  subdomains included) or by account (`user@example.com`). A post whose
+  account is there but cannot be read is dropped too, so a blocked account
+  cannot slip through with a broken `acct`.
 - **Runtime streams.** The `streams` table decides which streaming APIs are
   read. It is seeded once from `streams` in the config; a supervisor
   reconciles running streams with it every 30 s and on every admin change.
@@ -95,7 +103,7 @@ What changed:
 | --- | --- |
 | `streams` | Initial stream list, used once to seed the `streams` table. |
 | `admin_listen_port` | Port of the admin API, bound to 127.0.0.1 only. Unset: no admin API and no `/metrics`. |
-| `admin_token_file` | File holding the admin bearer token: one word of at least 32 characters. A regular file, not a symlink, mode `0600` or `0640` (no other bits). Required with `admin_listen_port`; buzzrelay refuses to start if it is unusable. |
+| `admin_token_file` | File holding the admin bearer token: one word of at least 32 characters. A regular file, not a symlink, mode `0600` or `0640` (no other bits), owned by root or by the user the service runs as. Required with `admin_listen_port`; buzzrelay refuses to start if it is unusable. |
 
 Making the token and a first request (FreeBSD, service user `buzzrelay`):
 
@@ -104,7 +112,7 @@ Making the token and a first request (FreeBSD, service user `buzzrelay`):
 chown root:buzzrelay /usr/local/etc/cloudbsd/buzzrelay/admin.token
 chmod 640 /usr/local/etc/cloudbsd/buzzrelay/admin.token
 # the header goes in a file so the token is never on a command line
-printf 'Authorization: Bearer %s\n' "$(cat /usr/local/etc/cloudbsd/buzzrelay/admin.token)" > /root/relay-admin.hdr
+( umask 077; rm -f /root/relay-admin.hdr; printf 'Authorization: Bearer %s\n' "$(cat /usr/local/etc/cloudbsd/buzzrelay/admin.token)" > /root/relay-admin.hdr )
 curl -H @/root/relay-admin.hdr http://127.0.0.1:3001/admin/health
 curl -H @/root/relay-admin.hdr -H 'content-type: application/json' \
   -X DELETE -d '{"domain": "example.com"}' http://127.0.0.1:3001/admin/blocks/domains
@@ -117,12 +125,13 @@ is `401`. Bodies are JSON. Mutations are idempotent: a repeated PUT updates,
 a DELETE of something absent answers `{"deleted": false}`. Errors are
 `{"error": "..."}` with `400` (bad input) or `500`. DELETE takes its JSON
 body too (`-H 'content-type: application/json' -d ...`). Stream URLs must be
-https and are shown with credentials (`access_token=...`) replaced by
-`REDACTED`.
+https and are shown with every query value but `local`, `remote`,
+`only_media`, `tag` and `list` replaced by `REDACTED`, and with the
+userinfo replaced as well.
 
 In `/admin/stats`, `followers.follows` counts follow rows, `followers.followers`
 distinct follower actors, `followers.inboxes` distinct inboxes. A post counts
-as relayed when it was queued for at least one inbox. Stream `state` is
+as relayed when a queue accepted at least one delivery for it. Stream `state` is
 `connecting`, `connected` or `retrying`; `since` is the Unix time of the last
 state change; `posts` and `connects` count since the stream task started.
 Blocking a domain deletes its follows without sending Rejects (no traffic goes
@@ -130,9 +139,9 @@ to a blocked domain); removing a subscriber sends one per follow.
 
 | Method and path | Body / query | Answer |
 | --- | --- | --- |
-| `GET /admin/health` | | `{status, version, paused, database, streams_enabled, streams_running, streams_connected}`; `status` is `ok` or `degraded`, `503` when the database is unreachable |
-| `GET /admin/stats` | | followers (totals, by actor, by domain), counters (posts relayed or skipped, deliveries enqueued, skipped, dropped, ok, failed, follows accepted and rejected), hosts with a queue or backoff, streams |
-| `GET /admin/subscribers` | `?actor=<relay actor URI>&domain=<domain>` (domain matches the follower's actor host or inbox host, subdomains included: the same rule as a domain block) | `[{id, inbox, actor, domain}]`: follower actor id, its inbox, the relay actor followed, the follower's actor host |
+| `GET /admin/health` | | `{status, version, paused, database, streams_enabled, streams_running, streams_connected}`; `status` is `ok` or `degraded`, `503` when the database is unreachable or the stream list cannot be read |
+| `GET /admin/stats` | | followers (totals, by actor, by domain), counters (posts relayed or skipped, deliveries enqueued, skipped, dropped, ok, failed, follows accepted and rejected, subscribers removed, rejects sent and failed), hosts with a queue or backoff, streams |
+| `GET /admin/subscribers` | `?actor=<relay actor URI>&domain=<domain>` (domain matches the follower's actor host or inbox host, subdomains included) | `[{id, inbox, actor, domain}]`: follower actor id, its inbox, the relay actor followed, the follower's actor host |
 | `DELETE /admin/subscribers` | `{"id": "<follower actor id>", "actor": "<relay actor URI, optional>"}` | `{removed, rejects_sent}` |
 | `GET /admin/blocks/domains` | | `[{domain, reason, created_at}]` |
 | `PUT /admin/blocks/domains` | `{"domain": "example.com", "reason": "..."}` | `{domain, created, removed_follows}` |

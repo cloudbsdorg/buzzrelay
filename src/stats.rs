@@ -62,7 +62,26 @@ counters!(
     follows_accepted,
     follows_rejected,
     subscribers_removed,
+    rejects_sent,
+    rejects_failed,
 );
+
+impl Counters {
+    /// Records that `removed` follow rows are gone: the counter counts the
+    /// rows, not the Rejects that were sent for them.
+    pub fn record_removed(&self, removed: usize) {
+        self.subscribers_removed.fetch_add(removed as u64, Ordering::Relaxed);
+    }
+
+    /// Records one Reject to a removed follower: delivered or failed.
+    pub fn record_reject(&self, delivered: bool) {
+        if delivered {
+            self.rejects_sent.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.rejects_failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 pub fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -148,5 +167,23 @@ mod test {
         assert!(hosts[1].backoff_seconds > 0 && hosts[1].backoff_seconds <= 20);
         bump(&stats.counters.posts_relayed);
         assert_eq!(stats.counters.snapshot().posts_relayed, 1);
+    }
+
+    #[test]
+    fn a_removal_counts_the_rows_and_both_kinds_of_reject() {
+        let counters = Counters::default();
+        counters.record_removed(3);
+        counters.record_reject(true);
+        counters.record_reject(true);
+        counters.record_reject(false);
+        let snapshot = counters.snapshot();
+        // the rows that are gone, not the rejects that were sent
+        assert_eq!(snapshot.subscribers_removed, 3);
+        assert_eq!(snapshot.rejects_sent, 2);
+        assert_eq!(snapshot.rejects_failed, 1);
+        // the counters are serialised for the admin API
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("\"rejects_failed\":1"), "{json}");
+        assert!(json.contains("\"rejects_sent\":2"), "{json}");
     }
 }
