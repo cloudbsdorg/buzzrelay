@@ -23,6 +23,8 @@ redis:
   connection: "redis://127.0.0.1:6378/"
   password_file: "redis_password.txt"
   in_topic: "relay-in"
-# Optional admin API, loopback only (see README)
+# Admin API, loopback only (see README).
+# With admin_listen_port set, admin_token_file is required: buzzrelay
+# refuses to start without a usable token file.
 #admin_listen_port: 3001
 #admin_token_file: "admin.token"

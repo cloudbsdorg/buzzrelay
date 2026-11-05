@@ -139,10 +139,42 @@ impl Policy {
         blocked
     }
 
-    /// Is a would-be follower on a blocked domain? Both its actor id and its
-    /// inbox count, so a blocked instance cannot subscribe through a
-    /// sharedInbox elsewhere or an actor hosted elsewhere.
-    pub fn follower_blocked(&self, actor_id: &str, inbox: &str) -> bool {
+    /// Is a would-be follower on a blocked domain? Fails closed.
+    ///
+    /// `fetched_uri` is the URL the relay fetched the actor document from.
+    /// The document's own `id` is self-declared and may name any host, so
+    /// the block keys on the URL that was really fetched as well.
+    ///
+    /// The follower is blocked when the fetched URI's host, the actor id's
+    /// host or the inbox's host is on a blocked domain. It is also blocked
+    /// when the fetched URI or the inbox cannot be read at all: a URL that
+    /// cannot be parsed cannot be shown to be clear. An actor id that is
+    /// not a URL (an `acct:`, say) names no host and is skipped: the
+    /// fetched URI covers it.
+    pub fn follower_blocked(&self, actor_id: &str, inbox: &str, fetched_uri: &str) -> bool {
+        let Some(fetched_host) = host_of(fetched_uri) else {
+            // the URL that was fetched cannot be read: fail closed
+            return true;
+        };
+        let Some(inbox_host) = host_of(inbox) else {
+            // no inbox to deliver to, and no host to check: fail closed
+            return true;
+        };
+        if self.domain_blocked(&fetched_host) || self.domain_blocked(&inbox_host) {
+            return true;
+        }
+        // an actor id that is not a URL names no host to check
+        host_of(actor_id).is_some_and(|host| self.domain_blocked(&host))
+    }
+
+    /// Does the follower's actor or inbox host fall on a blocked domain?
+    /// For listing, filtering and removing stored follows: an unreadable
+    /// host is not a match. Removal must use this same rule, because the
+    /// admin client's dry run lists the follows to delete with it; a follow
+    /// whose host cannot be read is tied to no domain, so blocking one does
+    /// not sweep it away. (A stored follow keeps the actor's id and inbox,
+    /// not the URI it was fetched from, so only those two legs apply.)
+    pub fn follower_matches(&self, actor_id: &str, inbox: &str) -> bool {
         [actor_id, inbox].iter()
             .filter_map(|url| host_of(url))
             .any(|host| self.domain_blocked(&host))
@@ -221,7 +253,7 @@ mod test {
         assert!(!Policy::default().domain_blocked("spam.example"));
         // a fully qualified name with its trailing dot is the same host
         assert!(policy.domain_blocked("spam.example."));
-        assert!(policy.follower_blocked("https://spam.example./users/a", "https://ok.example/inbox"));
+        assert!(policy.follower_blocked("https://spam.example./users/a", "https://ok.example/inbox", "https://spam.example./users/a"));
     }
 
     #[test]
@@ -243,9 +275,59 @@ mod test {
     #[test]
     fn followers_are_blocked_by_actor_or_inbox_host() {
         let policy = Policy::new(["spam.example".to_string()], [], false);
-        assert!(policy.follower_blocked("https://spam.example/users/a", "https://ok.example/inbox"));
-        assert!(policy.follower_blocked("https://ok.example/users/a", "https://m.spam.example/inbox"));
-        assert!(!policy.follower_blocked("https://ok.example/users/a", "https://ok.example/inbox"));
-        assert!(!policy.follower_blocked("not a url", "also not"));
+        assert!(policy.follower_blocked("https://spam.example/users/a", "https://ok.example/inbox", "https://spam.example/users/a"));
+        assert!(policy.follower_blocked("https://ok.example/users/a", "https://m.spam.example/inbox", "https://ok.example/users/a"));
+        assert!(!policy.follower_blocked("https://ok.example/users/a", "https://ok.example/inbox", "https://ok.example/users/a"));
+    }
+
+    #[test]
+    fn a_stored_follow_with_an_unreadable_host_matches_no_domain() {
+        // blocking a domain must not sweep away follows tied to no domain,
+        // and must delete exactly what the dry run listed
+        let policy = Policy::new(["spam.example".to_string()], [], false);
+        assert!(!policy.follower_matches("https://ok.example/users/a", "not a url"));
+        assert!(!policy.follower_matches("not a url", "also not"));
+        assert!(policy.follower_matches("not a url", "https://spam.example/inbox"));
+    }
+
+    #[test]
+    fn a_follow_is_blocked_by_the_url_that_was_fetched() {
+        let policy = Policy::new(["spam.example".to_string()], [], false);
+        // the document's own id is self-declared: the fetched URI decides
+        assert!(policy.follower_blocked(
+            "https://ok.example/users/a",
+            "https://ok.example/inbox",
+            "https://spam.example/users/a",
+        ));
+        // an id that is not a URL carries no host: the fetched URI covers it
+        assert!(policy.follower_blocked(
+            "acct:bot@spam.example",
+            "https://ok.example/inbox",
+            "https://spam.example/users/a",
+        ));
+        // an unreadable inbox cannot be shown to be clear
+        assert!(policy.follower_blocked(
+            "https://ok.example/users/a",
+            "not a url",
+            "https://ok.example/users/a",
+        ));
+        // an unreadable fetched URI fails closed as well
+        assert!(policy.follower_blocked(
+            "https://ok.example/users/a",
+            "https://ok.example/inbox",
+            "not a url",
+        ));
+        // a normal follower is not blocked
+        assert!(!policy.follower_blocked(
+            "https://ok.example/users/a",
+            "https://ok.example/inbox",
+            "https://ok.example/users/a",
+        ));
+        // an id that is not a URL is skipped: it names no host to check
+        assert!(!policy.follower_blocked(
+            "acct:bot@spam.example",
+            "https://ok.example/inbox",
+            "https://ok.example/users/a",
+        ));
     }
 }

@@ -13,13 +13,20 @@ use tokio::{sync::Notify, task::JoinHandle};
 pub const RECONCILE_PERIOD: Duration = Duration::from_secs(30);
 
 /// Stream URLs may carry an access token (Mastodon 4.2+). Anything shown
-/// outside the process goes through this: query values whose name looks
-/// like a credential, and any userinfo password, are replaced.
+/// outside the process goes through this: every query value but the ones
+/// on the allowlist is replaced, and the userinfo is replaced as well,
+/// name and password alike.
 pub fn redact_url(url: &str) -> String {
     const REDACTED: &str = "REDACTED";
+    /// The query values that carry no secret and are worth showing.
+    const ALLOWED: &[&str] = &["local", "remote", "only_media", "tag", "list"];
     let Ok(mut parsed) = reqwest::Url::parse(url) else {
         return REDACTED.to_string();
     };
+    // the userinfo name may be the token
+    if !parsed.username().is_empty() {
+        let _ = parsed.set_username(REDACTED);
+    }
     if parsed.password().is_some() {
         let _ = parsed.set_password(Some(REDACTED));
     }
@@ -27,9 +34,8 @@ pub fn redact_url(url: &str) -> String {
         let pairs: Vec<(String, String)> = parsed.query_pairs()
             .map(|(k, v)| {
                 let name = k.to_ascii_lowercase();
-                let secret = ["token", "key", "secret", "password", "auth"]
-                    .iter().any(|word| name.contains(word));
-                (k.into_owned(), if secret { REDACTED.to_string() } else { v.into_owned() })
+                let keep = ALLOWED.contains(&name.as_str());
+                (k.into_owned(), if keep { v.into_owned() } else { REDACTED.to_string() })
             })
             .collect();
         parsed.query_pairs_mut().clear().extend_pairs(pairs);
@@ -156,8 +162,24 @@ mod test {
             redact_url("https://m.example/api/v1/streaming/public?access_token=s3cr3t&local=true"),
             "https://m.example/api/v1/streaming/public?access_token=REDACTED&local=true",
         );
-        assert_eq!(redact_url("https://u:pw@m.example/s?apiKey=k"), "https://u:REDACTED@m.example/s?apiKey=REDACTED");
+        assert_eq!(redact_url("https://u:pw@m.example/s?apiKey=k"), "https://REDACTED:REDACTED@m.example/s?apiKey=REDACTED");
         assert!(!redact_url("not a url with s3cr3t").contains("s3cr3t"));
+    }
+
+    #[test]
+    fn every_query_value_is_redacted_except_the_allowlist() {
+        // a value whose name does not look like a credential is one anyway
+        assert_eq!(redact_url("https://m.example/s?jwt=x"), "https://m.example/s?jwt=REDACTED");
+        assert_eq!(redact_url("https://m.example/s?code=x"), "https://m.example/s?code=REDACTED");
+        assert_eq!(redact_url("https://m.example/s?anything=else"), "https://m.example/s?anything=REDACTED");
+        // the allowlist keeps the values the relay needs to show
+        assert_eq!(redact_url("https://m.example/s?local=true"), "https://m.example/s?local=true");
+        assert_eq!(
+            redact_url("https://m.example/s?remote=true&only_media=false&tag=bsd&list=mods"),
+            "https://m.example/s?remote=true&only_media=false&tag=bsd&list=mods",
+        );
+        // the userinfo name is a secret as well
+        assert_eq!(redact_url("https://user:mypass@m.example/s"), "https://REDACTED:REDACTED@m.example/s");
     }
 
     #[test]

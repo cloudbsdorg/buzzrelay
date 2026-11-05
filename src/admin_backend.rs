@@ -11,7 +11,7 @@ use crate::{
     policy::Policy,
     send,
     state::State,
-    stats::{bump, CounterSnapshot, HostSnapshot},
+    stats::{CounterSnapshot, HostSnapshot},
     streams::{StreamStatus, Supervisor},
 };
 
@@ -29,6 +29,7 @@ impl RelayAdmin {
     }
 
     /// A signed Reject{Follow} from the relay actor to the removed follower.
+    /// True when it was delivered.
     async fn send_reject(&self, follow: &Follow) -> bool {
         let reject = activitypub::follow_response(
             FollowResponse::Reject,
@@ -41,11 +42,12 @@ impl RelayAdmin {
         let key_id = format!("{}#key", follow.actor);
         match send::send(&self.state.client, &follow.inbox, &key_id, &self.state.priv_key, &reject).await {
             Ok(()) => {
-                bump(&self.state.stats.counters.subscribers_removed);
+                self.state.stats.counters.record_reject(true);
                 true
             }
             Err(e) => {
                 tracing::error!("reject to {}: {e}", follow.inbox);
+                self.state.stats.counters.record_reject(false);
                 false
             }
         }
@@ -73,6 +75,8 @@ impl AdminBackend for RelayAdmin {
                 rejects_sent += 1;
             }
         }
+        // the counter counts the rows that are gone, not the Rejects sent
+        self.state.stats.counters.record_removed(removed.len());
         Ok(SubscribersRemoved { removed: removed.len(), rejects_sent })
     }
 
@@ -90,6 +94,8 @@ impl AdminBackend for RelayAdmin {
         // before the reload is still deleted below
         self.reload().await?;
         let removed = self.state.database.remove_follows_on_domain(&domain).await?;
+        // follows removed by a block are removed subscribers too
+        self.state.stats.counters.record_removed(usize::try_from(removed).unwrap_or(0));
         Ok((created, removed))
     }
 

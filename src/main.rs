@@ -216,7 +216,7 @@ async fn post_relay(
     };
     if is_follow {
         let target = retarget(target, action.object.as_ref(), &state.hostname);
-        let blocked = state.policy().follower_blocked(&remote_actor.id, &remote_actor.inbox);
+        let blocked = state.policy().follower_blocked(&remote_actor.id, &remote_actor.inbox, &endpoint.remote_actor_uri);
         tokio::spawn(answer_follow(state, target, remote_actor, endpoint.payload, action.id, blocked));
         return accepted();
     }

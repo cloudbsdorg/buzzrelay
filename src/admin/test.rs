@@ -10,6 +10,7 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 struct Mock {
     calls: Arc<Mutex<Vec<String>>>,
     db_down: bool,
+    streams_down: bool,
     streams: Vec<StreamRow>,
     follows: Vec<Follow>,
 }
@@ -53,7 +54,12 @@ impl AdminBackend for Mock {
         self.log(format!("unblock {kind:?} {key}"));
         Ok(false)
     }
-    async fn streams(&self) -> BackendResult<Vec<StreamRow>> { Ok(self.streams.clone()) }
+    async fn streams(&self) -> BackendResult<Vec<StreamRow>> {
+        if self.streams_down {
+            return Err(BackendError("streams: down".into()));
+        }
+        Ok(self.streams.clone())
+    }
     fn stream_statuses(&self) -> Vec<(String, StreamStatus)> {
         self.streams.iter().take(1).map(|s| (s.url.clone(), StreamStatus {
             state: StreamState::Connected, since: 1, posts: 5, connects: 1, last_error: None,
@@ -141,6 +147,16 @@ async fn health_reports_and_degrades() {
     let (status, body) = call(down, "GET", "/admin/health", bearer(), None).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(json(&body)["status"], "degraded");
+}
+
+#[tokio::test]
+async fn health_is_degraded_when_the_streams_query_fails() {
+    let down = Mock { streams_down: true, ..mock() };
+    let (status, body) = call(down, "GET", "/admin/health", bearer(), None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let health: Health = serde_json::from_str(&body).unwrap();
+    assert_eq!(health.status, "degraded", "a stream list that cannot be read is not an empty one");
+    assert!(health.database, "the database is fine");
 }
 
 #[tokio::test]
@@ -283,6 +299,22 @@ fn token_file(name: &str, contents: &str, mode: u32) -> std::path::PathBuf {
     std::fs::write(&path, contents).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
     path
+}
+
+#[test]
+fn token_files_must_be_owned_by_root_or_by_this_process() {
+    use std::os::unix::fs::MetadataExt;
+    let good = format!("{TOKEN}\n");
+    // a file this process owns is fine
+    let own = token_file("own", &good, 0o600);
+    assert!(AdminToken::from_file(&own).is_ok(), "a file we own is allowed");
+    // the process uid is the owner of a file it creates
+    let meta = std::fs::metadata(&own).unwrap();
+    assert_eq!(meta.uid(), effective_uid());
+    // and nobody else may own it
+    assert!(owner_allowed(0, 1000), "root may own the token file");
+    assert!(owner_allowed(1000, 1000), "the process may own it");
+    assert!(!owner_allowed(4242, 1000), "another user may not");
 }
 
 #[test]

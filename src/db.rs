@@ -225,7 +225,7 @@ impl Database {
         let only = Policy::new([domain.to_string()], [], false);
         let followers: Vec<String> = self.list_follows(None).await?
             .into_iter()
-            .filter(|f| only.follower_blocked(&f.id, &f.inbox))
+            .filter(|f| only.follower_matches(&f.id, &f.inbox))
             .map(|f| f.id)
             .collect();
         if followers.is_empty() {
@@ -415,7 +415,8 @@ pub struct StreamRow {
 
 /// PostgreSQL-backed tests. They need a server: set `BUZZRELAY_TEST_DB` to a
 /// libpq connection string for a database the test user may create schemas
-/// in, and run `cargo test -- --ignored`. Each test works in its own schema.
+/// in, and run `cargo test -- --include-ignored`. Each test works in its own
+/// schema.
 #[cfg(test)]
 mod test {
     use super::MIGRATIONS;

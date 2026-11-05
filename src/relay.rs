@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sigh::PrivateKey;
 use tokio::sync::mpsc::Receiver;
-use crate::{send, actor, state::State, policy::{self, Policy}, stats::{bump, HostState, RelayStats}};
+use crate::{send, actor, state::State, policy::{self, Policy}, stats::{bump, Counters, HostState, RelayStats}};
 
 #[derive(Deserialize)]
 struct Post<'a> {
@@ -13,10 +13,45 @@ struct Post<'a> {
     pub uri: &'a str,
     pub tags: Option<Vec<Tag<'a>>>,
     pub language: Option<&'a str>,
-    pub account: Option<Account>,
+    /// The account as the sender wrote it: it may be missing, null, or
+    /// not an object at all. A broken one no longer fails the whole parse;
+    /// `author` says what it is worth.
+    pub account: Option<serde_json::Value>,
+}
+
+/// What a post says about its author.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Author<'a> {
+    /// no account, or an account without an acct: no account filter applies
+    Absent,
+    Acct(&'a str),
+    /// an account or acct that is there but cannot be read
+    Unreadable,
 }
 
 impl Post<'_> {
+    pub fn author(&self) -> Author<'_> {
+        let Some(account) = self.account.as_ref().filter(|a| !a.is_null()) else {
+            return Author::Absent;
+        };
+        let Some(object) = account.as_object() else {
+            return Author::Unreadable;
+        };
+        match object.get("acct") {
+            None => Author::Absent,
+            Some(serde_json::Value::String(acct)) => Author::Acct(acct),
+            Some(_) => Author::Unreadable,
+        }
+    }
+
+    /// The author's acct, when the post names one that can be read.
+    pub fn acct(&self) -> Option<&str> {
+        match self.author() {
+            Author::Acct(acct) => Some(acct),
+            _ => None,
+        }
+    }
+
     pub fn host(&self) -> Option<String> {
         reqwest::Url::parse(self.url?)
             .ok()
@@ -72,9 +107,13 @@ fn post_verdict(policy: &Policy, post: &Post) -> PostVerdict {
     if policy.paused {
         return PostVerdict::Paused;
     }
+    // an author that is there but cannot be read cannot be shown not to be
+    // a blocked account: fail closed, as the domain rules do
+    if post.author() == Author::Unreadable {
+        return PostVerdict::SourceBlocked;
+    }
     let host = post.host();
-    let acct = post.account.as_ref()
-        .and_then(|account| policy::full_acct(&account.acct, host.as_deref()));
+    let acct = post.acct().and_then(|acct| policy::full_acct(acct, host.as_deref()));
     // url and uri are both the sender's to choose: either naming a blocked host drops the post
     let uri_host = policy::host_of(post.uri);
     if policy.source_blocked(host.as_deref(), acct.as_deref())
@@ -101,13 +140,6 @@ fn inbox_verdict(policy: &Policy, inbox_host: Option<&str>, post_host: Option<&s
         Some(inbox_host) if policy.domain_blocked(inbox_host) => InboxVerdict::DomainBlocked,
         _ => InboxVerdict::Deliver,
     }
-}
-
-#[derive(Deserialize)]
-struct Account {
-    /// absent: no account filter applies, the post still relays
-    #[serde(default)]
-    acct: String,
 }
 
 /// The relay actors a hashtag is delivered to. Hashtags that end in a
@@ -179,17 +211,26 @@ fn spawn_worker(client: Arc<reqwest::Client>, host: Arc<HostState>, stats: Arc<R
 }
 
 /// Hands one Announce to the worker queue of the inbox's host.
-fn enqueue(state: &State, workers: &mut HashMap<String, Sender<Job>>, job: Job) {
+/// True when the queue took the job.
+fn enqueue(state: &State, workers: &mut HashMap<String, Sender<Job>>, job: Job) -> bool {
     let host_name = job.inbox_url.host_str().unwrap_or("").to_string();
     let host = state.stats.host(&host_name);
     let tx = workers.entry(host_name)
         .or_insert_with(|| spawn_worker(state.client.clone(), host.clone(), state.stats.clone()));
+    try_queue(tx, job, &host, &state.stats.counters)
+}
+
+/// Puts one job on a queue: true when it was taken, false when the queue
+/// was full and the job was dropped.
+fn try_queue<T>(tx: &mut Sender<T>, job: T, host: &HostState, counters: &Counters) -> bool {
     host.queued.fetch_add(1, Ordering::Relaxed);
     if tx.try_send(job).is_ok() {
-        bump(&state.stats.counters.deliveries_enqueued);
+        bump(&counters.deliveries_enqueued);
+        true
     } else {
         host.queued.fetch_sub(1, Ordering::Relaxed);
-        bump(&state.stats.counters.deliveries_dropped_queue_full);
+        bump(&counters.deliveries_dropped_queue_full);
+        false
     }
 }
 
@@ -247,15 +288,17 @@ async fn deliver(
                 continue;
             }
         }
-        enqueue(state, workers, Job {
+        if enqueue(state, workers, Job {
             post_url: delivery.post_url.clone(),
             actor_id: actor_id.clone(),
             body: delivery.body.clone(),
             key_id: actor.key_id(),
             private_key: state.priv_key.clone(),
             inbox_url,
-        });
-        queued += 1;
+        }) {
+            // only a job the queue took counts as a delivery
+            queued += 1;
+        }
     }
     queued
 }
@@ -305,12 +348,18 @@ async fn relay_post(state: &State, workers: &mut HashMap<String, Sender<Job>>, d
         queued += deliver(state, workers, &actor, &delivery, &mut seen_inboxes).await;
     }
     // relayed = handed to at least one inbox queue, not merely matched
-    if queued == 0 {
+    count_post(&state.stats.counters, queued);
+}
+
+/// Counts one relayed post: it counts as relayed only when at least one
+/// job was accepted by a queue.
+fn count_post(counters: &Counters, accepted: usize) {
+    if accepted == 0 {
         counter!("relay_posts_total", "action" => "no_relay").increment(1);
-        bump(&state.stats.counters.posts_without_followers);
+        bump(&counters.posts_without_followers);
     } else {
         counter!("relay_posts_total", "action" => "relay").increment(1);
-        bump(&state.stats.counters.posts_relayed);
+        bump(&counters.posts_relayed);
     }
 }
 
@@ -457,7 +506,7 @@ mod test {
             uri: url,
             tags: None,
             language: None,
-            account: acct.map(|acct| Account { acct: acct.to_string() }),
+            account: acct.map(|acct| serde_json::json!({"acct": acct})),
         }
     }
 
@@ -495,8 +544,57 @@ mod test {
     fn posts_parse_the_author_acct() {
         let data = r#"{"url":"https://a.example/@alice/1","uri":"https://a.example/users/alice/statuses/1","account":{"acct":"alice","id":"1"}}"#;
         let post: Post = serde_json::from_str(data).unwrap();
-        assert_eq!(post.account.unwrap().acct, "alice");
+        assert_eq!(post.acct(), Some("alice"));
         let odd = r#"{"url":"https://a.example/@alice/1","uri":"https://a.example/1","account":{"id":"1"}}"#;
-        assert!(serde_json::from_str::<Post>(odd).is_ok(), "an account without acct must not drop the post");
+        let post: Post = serde_json::from_str(odd).unwrap();
+        assert_eq!(post.acct(), None, "an account without acct must not drop the post");
+    }
+
+    #[test]
+    fn a_post_with_a_broken_account_still_parses() {
+        // the post parses; what it is worth depends on the account field
+        let policy = Policy::new([], [
+            policy::SourcePattern::parse("bot@a.example").unwrap(),
+        ], false);
+        for (data, want) in [
+            // no account, or no acct in it: no account filter applies, as upstream
+            (r#"{"url":"https://a.example/@bot/1","uri":"https://a.example/1"}"#, PostVerdict::Relay),
+            (r#"{"url":"https://a.example/@bot/1","uri":"https://a.example/1","account":null}"#, PostVerdict::Relay),
+            (r#"{"url":"https://a.example/@bot/1","uri":"https://a.example/1","account":{"id":"1"}}"#, PostVerdict::Relay),
+            // an account that is there but cannot be read cannot be shown
+            // not to be a blocked one: dropped, so a blocked account cannot
+            // slip through by sending a broken acct
+            (r#"{"url":"https://a.example/@bot/1","uri":"https://a.example/1","account":{"acct":null}}"#, PostVerdict::SourceBlocked),
+            (r#"{"url":"https://a.example/@bot/1","uri":"https://a.example/1","account":{"acct":7}}"#, PostVerdict::SourceBlocked),
+            (r#"{"url":"https://a.example/@bot/1","uri":"https://a.example/1","account":"bot"}"#, PostVerdict::SourceBlocked),
+        ] {
+            let post: Post = serde_json::from_str(data)
+                .unwrap_or_else(|e| panic!("{data} must parse: {e}"));
+            assert_eq!(post_verdict(&policy, &post), want, "{data}");
+        }
+    }
+
+    #[test]
+    fn a_job_is_only_counted_when_the_queue_takes_it() {
+        let (mut tx, _rx) = channel(0);
+        let host = HostState::default();
+        let counters = Counters::default();
+        assert!(try_queue(&mut tx, 1u8, &host, &counters), "the first job fits into the queue");
+        assert!(!try_queue(&mut tx, 2u8, &host, &counters), "the queue is full now");
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.deliveries_enqueued, 1);
+        assert_eq!(snapshot.deliveries_dropped_queue_full, 1);
+        assert_eq!(host.queued.load(Ordering::Relaxed), 1, "the dropped job is not queued");
+    }
+
+    #[test]
+    fn a_post_counts_as_relayed_only_when_a_job_was_accepted() {
+        let counters = Counters::default();
+        count_post(&counters, 0);
+        assert_eq!(counters.snapshot().posts_relayed, 0);
+        assert_eq!(counters.snapshot().posts_without_followers, 1);
+        count_post(&counters, 2);
+        assert_eq!(counters.snapshot().posts_relayed, 1);
+        assert_eq!(counters.snapshot().posts_without_followers, 1);
     }
 }
